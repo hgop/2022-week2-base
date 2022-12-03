@@ -21,7 +21,7 @@ def test_status():
 @patch("connect4.tokens.generate_token")
 def test_create_game(mock_generate_token, mock_add_player_to_game, mock_create_game):
     mock_generate_token.side_effect = ["token1", "token2"]
-    mock_create_game.return_value = None
+    mock_create_game.return_value = database.GameEntity(None, None, None, None, None)
     mock_add_player_to_game.return_value = None
     message, code = app_logic.create_game({})
     assert {
