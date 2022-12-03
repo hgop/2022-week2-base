@@ -1,0 +1,190 @@
+version: 2.1
+
+# Setup remote docker environment
+# https://circleci.com/docs/2.0/building-docker-images/
+orbs:
+  kubernetes: circleci/kubernetes@1.3.1
+
+executors:
+  node-environment:
+    docker:
+      - image: cimg/node:18.12
+  python-environment:
+    docker:
+      - image: cimg/python:3.8
+
+  docker-environment:
+    docker:
+      - image: cimg/base:stable
+    environment:
+      CLIENT_IMAGE_NAME: {{YOUR_USERNAME}}/connect4-client
+      SERVER_IMAGE_NAME: {{YOUR_USERNAME}}/connect4-server
+
+jobs:
+  server-lint-test:
+    executor: python-environment
+    environment:
+      PROJECT_DIRECTORY: ./src/connect4-server
+      PYTHONPATH: /home/circleci/project/src/connect4-server/src
+    steps:
+      - checkout
+      - run: pip install -r $PROJECT_DIRECTORY/requirements.txt
+      - run: pip install -r $PROJECT_DIRECTORY/requirements_dev.txt
+      - run: mypy $PROJECT_DIRECTORY/src/tests/unit/
+
+  client-lint-test:
+    executor: node-environment
+    environment:
+      PROJECT_DIRECTORY: ./src/connect4-client
+    steps:
+      - checkout
+      - run: cd $PROJECT_DIRECTORY && npm install
+      - run: cd $PROJECT_DIRECTORY && npm run lint
+      - run: cd $PROJECT_DIRECTORY && npm test
+
+  build-publish-server:
+    executor: docker-environment
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true # default - false
+      - run:
+          name: "Docker build Server"
+          command: docker build src/connect4-server -t $SERVER_IMAGE_NAME:$CIRCLE_SHA1
+      - run:
+          name: Publish Docker Image to Docker Hub
+          command: |
+            echo "$DOCKERHUB_ACCESS_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+            docker push $SERVER_IMAGE_NAME:$CIRCLE_SHA1
+  build-publish-client:
+    executor: docker-environment
+    steps:
+      - checkout
+      - setup_remote_docker:
+          docker_layer_caching: true # default - false
+      - run:
+          name: "Docker build Client"
+          command: docker build src/connect4-client -t $CLIENT_IMAGE_NAME:$CIRCLE_SHA1
+      - run:
+          name: Publish Docker Image to Docker Hub
+          command: |
+            echo "$DOCKERHUB_ACCESS_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+            docker push $CLIENT_IMAGE_NAME
+
+  create-acceptance-environment:
+    executor: docker-environment
+    environment:
+      DATABASE_USERNAME: connect4
+      DATABASE_PASSWORD: connect4
+      CONNECT4_SERVER_DATABASE_USERNAME: Y29ubmVjdDQ=
+      CONNECT4_SERVER_DATABASE_PASSWORD: Y29ubmVjdDQ=
+      CONNECT4_SERVER_HOST: connect4-server.acceptance.{{YOUR_TEAMNAME}}.hgopteam.com
+      CONNECT4_SERVER_REPLICAS: 1
+    steps:
+    - checkout
+    - kubernetes/install-kubectl
+    - kubernetes/install-kubeconfig:
+        kubeconfig: KUBECONFIG_DATA
+    - run: bash ./scripts/ci/database/create_database.sh "acceptance"
+    - run: bash ./scripts/ci/deploy/create.sh "connect4-server" "${CIRCLE_SHA1}" > connect4-server.yaml
+    - run: kubectl delete --namespace acceptance job connect4-migrations || exit 0
+    - run: kubectl apply --namespace acceptance -f connect4-server.yaml
+
+  acceptance-test:
+    executor: python-environment
+    environment:
+      PROJECT_DIRECTORY: ./src/connect4-server
+      PYTHONPATH: /home/circleci/project/src/connect4-server/src
+      API_URL: "https://connect4-server.acceptance.{{YOUR_TEAMNAME}}.hgopteam.com/"
+    steps:
+      - checkout
+      - run: pip install -r $PROJECT_DIRECTORY/requirements_dev.txt
+      - run: pytest $PROJECT_DIRECTORY/src/tests/acceptance
+
+  create-capacity-environment:
+    docker:
+      - image: cimg/base:stable
+    environment:
+      DATABASE_USERNAME: connect4
+      DATABASE_PASSWORD: connect4
+      CONNECT4_SERVER_DATABASE_USERNAME: Y29ubmVjdDQ=
+      CONNECT4_SERVER_DATABASE_PASSWORD: Y29ubmVjdDQ=
+      CONNECT4_SERVER_HOST: connect4-server.capacity.{{YOUR_TEAMNAME}}.hgopteam.com
+      CONNECT4_SERVER_REPLICAS: 3
+    steps:
+      - checkout
+      - kubernetes/install-kubectl
+      - kubernetes/install-kubeconfig:
+          kubeconfig: KUBECONFIG_DATA
+      - run: ./scripts/ci/database/create_database.sh "capacity"
+      - run: ./scripts/ci/deploy/create.sh "connect4-server" "${CIRCLE_SHA1}" > connect4-server.yaml
+      - run: kubectl delete --namespace capacity job connect4-migrations || exit 0
+      - run: kubectl apply --namespace capacity -f connect4-server.yaml
+      - run: kubectl rollout status --namespace capacity deploy/connect4-server
+  
+  capacity-test:
+    executor: python-environment
+    environment:
+      PROJECT_DIRECTORY: ./src/connect4-server
+      PYTHONPATH: /home/circleci/project/src/connect4-server/src
+      API_URL: "https://connect4-server.capacity.{{YOUR_TEAMNAME}}.hgopteam.com/"
+    steps:
+      - checkout
+      - run: pip install -r $PROJECT_DIRECTORY/requirements_dev.txt
+      - run: pytest $PROJECT_DIRECTORY/src/tests/capacity
+    
+  deploy:
+    executor: docker-environment
+    environment:
+      CONNECT4_SERVER_HOST: connect4-server.{{YOUR_TEAMNAME}}.hgopteam.com
+      CONNECT4_SERVER_REPLICAS: 2
+    steps:
+      - checkout
+      - kubernetes/install-kubectl
+      - kubernetes/install-kubeconfig:
+          kubeconfig: KUBECONFIG_DATA
+      - run:
+          name: "Generating connect4 client yaml"
+          command: bash scripts/ci/deploy/create.sh "connect4-client" "${CIRCLE_SHA1}" > connect4-client.yaml
+      - run:
+          name: "Generating connect4 server yaml"
+          command: bash scripts/ci/deploy/create.sh "connect4-server" "${CIRCLE_SHA1}" > connect4-server.yaml
+      - run:
+          name: "Clean previous job"
+          command: kubectl delete job connect4-migrations || exit 0
+      - run:
+          name: "Deploy"
+          command: kubectl apply -f connect4-client.yaml -f connect4-server.yaml
+
+# Only deploy when main branch is updated
+workflows:
+  pipeline:
+    jobs:
+      - client-lint-test
+      - server-lint-test
+      - build-publish-client:
+          requires:
+            - client-lint-test
+      - build-publish-server:
+          requires:
+            - server-lint-test
+      - create-acceptance-environment:
+          requires:
+            - build-publish-server
+      - acceptance-test:
+          requires:
+            - create-acceptance-environment
+      - create-capacity-environment:
+          requires:
+            - build-publish-server
+      - capacity-test:
+          requires:
+            - create-capacity-environment
+      - deploy:
+          requires:
+            - acceptance-test
+            - capacity-test
+            - build-publish-client
+          filters:
+            branches:
+              only: main

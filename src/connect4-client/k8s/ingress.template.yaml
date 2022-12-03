@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: connect4-client
+  labels:
+    app: connect4-client
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt"
+spec:
+  rules:
+  - host: "connect4.{{YOUR_TEAMNAME}}.hgopteam.com"
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: connect4-client
+            port:
+              number: 8000
+  tls:
+  - hosts:
+    - "connect4.{{YOUR_TEAMNAME}}.hgopteam.com"
+    secretName: connect4-tls
+
+
